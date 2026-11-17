@@ -1,0 +1,42 @@
+{
+  "registry": "https://centrale-vindplaats.lblod.info/sparql",
+  "endpoints": [
+    "https://lokaalbeslist-harvester-0.s.redhost.be/sparql",
+    "https://lokaalbeslist-harvester-1.s.redhost.be/sparql",
+    "https://lokaalbeslist-harvester-2.s.redhost.be/sparql",
+    "https://lokaalbeslist-harvester-3.s.redhost.be/sparql"
+  ],
+  "predicate_blacklist": [
+    {
+      "predicate": "http://www.w3.org/ns/prov#wasDerivedFrom",
+      "comment": "Shared mandatarissen and codelist concepts carry thousands of publication links. This grows a migration from about 1k to about 70k triples and adds no decision content."
+    }
+  ],
+  "besturen": [
+    {
+      "uri": "http://data.lblod.info/id/bestuurseenheden/1b11f7f11c3c74c54acf86b8c1a9b8b2865e22b8973818486045a5d3aa8dff14",
+      "name": "Puurs"
+    },
+    {
+      "uri": "http://data.lblod.info/id/bestuurseenheden/57b1646f-bf4c-4dc4-8bc9-6ec8a6486018",
+      "name": "Lievegem"
+    },
+    {
+      "uri": "http://data.lblod.info/id/bestuurseenheden/add1e4eb-9ec7-4ea6-af82-335aa76b7d48",
+      "name": "Pajottegem"
+    },
+    {
+      "uri": "http://data.lblod.info/id/bestuurseenheden/b2ee8ae754844119d83712a384587b6086358c0673645a27bca3a66e845bce84",
+      "name": "Brakel"
+    },
+    {
+      "uri": "http://data.lblod.info/id/bestuurseenheden/ba4d960fe3e01984e15fd0b141028bab8f2b9b240bf1e5ab639ba0d7fe4dc522",
+      "name": "Aarschot"
+    },
+    {
+      "uri": "http://data.lblod.info/id/bestuurseenheden/c8f33e80-6f19-4ba1-a758-9d85f42d28d4",
+      "name": "Puurs-Sint-Amands"
+    }
+  ],
+  "graph_template": "http://mu.semte.ch/graphs/organizations/{uuid}/LoketLB-LPDCGebruiker"
+}
