@@ -1,5 +1,13 @@
 # besluiten fetch
 
+```bash
+mkdir -p out
+docker build -t besluiten-fetch .
+docker run --rm -v "$PWD/out:/app/out" besluiten-fetch
+```
+
+> Warning: this is LLM generated. Read the code before you trust it.
+
 Fetch besluiten for a set of bestuurseenheden from SPARQL endpoints. For each besluit it writes a mu-semtech migration: a `.ttl`, a `.graph` and a `.svg`.
 
 The data follows the besluit-publicatie model. The script walks the path of the besluit from the erkende standaard 2025-12-11 SHACL shape and keeps all triples of the resources on that path.
@@ -7,7 +15,6 @@ The data follows the besluit-publicatie model. The script walks the path of the 
 ## start
 
 ```bash
-docker build -t besluiten-fetch .
 BESTUUR="http://data.lblod.info/id/bestuurseenheden/c8f33e80-6f19-4ba1-a758-9d85f42d28d4"
 docker run --rm -v "$PWD/out:/app/out" besluiten-fetch --dry-run --only "$BESTUUR"
 docker run --rm -v "$PWD/out:/app/out" besluiten-fetch --limit 1 --only "$BESTUUR"
