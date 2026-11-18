@@ -10,6 +10,30 @@
     {
       "predicate": "http://www.w3.org/ns/prov#wasDerivedFrom",
       "comment": "Shared mandatarissen and codelist concepts carry thousands of publication links. This grows a migration from about 1k to about 70k triples and adds no decision content."
+    },
+    {
+      "predicate": "http://data.vlaanderen.be/ns/besluit#heeftVoorzitter",
+      "comment": "The chair is a mandataris record. It is not part of the decision path."
+    },
+    {
+      "predicate": "http://data.vlaanderen.be/ns/besluit#heeftSecretaris",
+      "comment": "The secretary is a mandataris record. It is not part of the decision path."
+    },
+    {
+      "predicate": "http://data.vlaanderen.be/ns/besluit#heeftAanwezige",
+      "comment": "Attendance lists add one mandataris record per member."
+    },
+    {
+      "predicate": "http://data.vlaanderen.be/ns/besluit#heeftAanwezigeBijStart",
+      "comment": "Attendance at the start of the meeting adds one mandataris record per member."
+    },
+    {
+      "predicate": "http://data.vlaanderen.be/ns/besluit#heeftStemming",
+      "comment": "Votes are not needed to read the decision."
+    },
+    {
+      "predicate": "http://lblod.data.gift/vocabularies/besluit/extractedDecisionContent",
+      "comment": "Links to extracted text files that the harvesters do not describe. The decision text is already in prov:value."
     }
   ],
   "besturen": [

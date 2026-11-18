@@ -3,19 +3,30 @@
 mu-semtech migration per besluit (a .graph + .ttl pair) plus an SVG drawing.
 
 Data comes from SPARQL endpoints with Lokaal Beslist or Centrale Vindplaats
-data that follows the besluit-publicatie model. The script walks the path of
-the besluit as described by the erkendestandaard 2025-12-11 SHACL shape:
+data that follows the besluit-publicatie model:
 
   https://data.vlaanderen.be/doc/applicatieprofiel/besluit-publicatie/erkendestandaard/2025-12-11/shacl/besluit-publicatie-SHACL.ttl
 
-The constraints are interpreted liberally: for every besluit we collect the
-besluit itself and the resources reachable along the SHACL paths (behandeling,
-agendapunt, zitting, stemming, mandataris, rechtsgrond, rechtsgrondonderdeel,
-bestuursorgaan, bestuurseenheid, documents), and we keep all their triples.
+For every besluit the script collects the resources on one fixed path and
+keeps their triples:
 
-Configuration lives in config.json: the endpoints to query and the
-bestuurseenheden to fetch. Run `python3 fetch_besluiten.py --help` for the
-options. See README.md for the Docker workflow.
+  zitting -> agendapunt <- behandeling van agendapunt <-> besluit -> artikel
+
+Only those resources are described. The bestuurseenheid, the bestuursorganen
+and the bestuursorganen in tijd are not included. Predicates that do not
+belong to the path stay in the graph as links but are not followed. The
+predicates in `predicate_blacklist` are not fetched at all.
+
+Discovery asks the registry for the bestuursorganen in tijd of a bestuur, then
+runs one small query per orgaan on the harvesters. It uses the first harvester
+that returns besluiten and ignores the other harvesters for that bestuur.
+
+The registry is not queried for besluiten.
+
+Configuration lives in config.json: the registry, the harvester endpoints, the
+predicate blacklist and the bestuurseenheden to fetch. Run
+`python3 fetch_besluiten.py --help` for the options. See README.md for the
+Docker workflow.
 """
 
 from __future__ import annotations
@@ -61,59 +72,49 @@ CONFIG_FILENAME = "config.json"
 TTL2SVG_REPO = "https://github.com/cecemel/ttl2svg.git"
 TTL2SVG_REF = "dbf5246bf1385052aaf549d9fdc0ac3d7cdce9a4"
 
-# Predicates we follow backwards (object -> subject) to discover related
-# resources that point at a seed. Kept intentionally tiny: broad inverse
-# predicates such as eli:has_part or dct:isPartOf pull in every sibling that
-# shares a part/parent (one bad artikel URI dragged in 138 besluiten), so we
-# only follow the one reverse link we actually need to reconstruct the path:
-# the zitting that behandelt an agendapunt.
-INVERSE_PREDICATES = [
-    "http://data.vlaanderen.be/ns/besluit#behandelt",  # zitting -> agendapunt
+MU_UUID = URIRef("http://mu.semte.ch/vocabularies/core/uuid")
+UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+BESLUIT_NS = "http://data.vlaanderen.be/ns/besluit#"
+ELI_NS = "http://data.europa.eu/eli/ontology#"
+PROV_NS = "http://www.w3.org/ns/prov#"
+DCT_NS = "http://purl.org/dc/terms/"
+
+
+@dataclass(frozen=True)
+class PathStep:
+    source: str
+    predicate: str
+    inverse: bool
+    target: str
+
+
+# The only links the script follows. Every resource on this path is described
+# in full (minus the blacklist). Other links stay in the graph as references
+# but are not expanded.
+PATH_STEPS = [
+    PathStep("besluit", PROV_NS + "wasGeneratedBy", False, "behandeling"),
+    PathStep("besluit", ELI_NS + "has_part", False, "artikel"),
+    PathStep("behandeling", DCT_NS + "subject", False, "agendapunt"),
+    PathStep("agendapunt", BESLUIT_NS + "behandelt", True, "zitting"),
 ]
 
-# Predicates whose objects we do NOT expand into new seeds, even when they are
-# in an allowed namespace. These are ordering/cross-besluit links that would
-# drag sibling besluiten/behandelingen into a migration that should describe a
-# single besluit. The triples themselves are still kept (they are fetched as
-# part of describing a resource); only further expansion is blocked.
-SKIP_EXPAND_PREDICATES = {
-    "http://data.vlaanderen.be/ns/besluit#gebeurtNa",        # behandeling -> previous behandeling
-    "http://data.vlaanderen.be/ns/besluit#aangebrachtNa",    # agendapunt -> previous agendapunt
-}
-
-# Namespace prefixes whose resources we expand (describe) while walking. URIs
-# outside this set are referenced but not expanded, so we do not drag in entire
-# external corpora.
-DEFAULT_ALLOW_NS = [
-    "http://data.lblod.info/",
-    "https://data.lblod.info/",
-    "http://data.vlaanderen.be/",
-    "https://data.vlaanderen.be/",
-    "http://mu.semte.ch/",
-]
-
-# Even when an allow-list namespace matches, never expand these: they are
-# ontology / vocabulary / authority namespaces whose description is schema, not
-# instance data, and would add rdfs:Class / owl:Class noise to every migration.
-# The rdf:type link itself is still kept (it is fetched with the instance).
-EXPAND_EXCLUDE_NS = [
-    "http://data.vlaanderen.be/ns/",
-    "https://data.vlaanderen.be/ns/",
-    "http://mu.semte.ch/vocabularies/",
-    "http://data.lblod.info/vocabularies/",
-    "http://lblod.data.gift/vocabularies/",
-    "http://www.w3.org/",
-    "http://schema.org/",
-    "https://schema.org/",
-    "http://purl.org/",
-    "http://publications.europa.eu/resource/authority/",
-    "http://data.europa.eu/eli/ontology#",  # the ELI ontology itself, not instances
+PATH_ROLES = [
+    "besluit",
+    "behandeling",
+    "artikel",
+    "agendapunt",
+    "zitting",
 ]
 
 SPARQL_TIMEOUT = 120  # seconds per request
 PROBE_TIMEOUT = 20   # seconds for the liveness ping
 HTTP_RETRIES = 3
 RETRY_BACKOFF = 5  # seconds
+HARVESTER_DELAY = 1.0  # seconds between calls to the same harvester
 
 
 # ---------------------------------------------------------------------------
@@ -137,21 +138,27 @@ def uri_to_safe_name(uri: str) -> str:
     return tail or "besluit"
 
 
-def host_of(uri: str) -> str:
-    try:
-        parsed = urllib.parse.urlparse(uri)
-        return f"{parsed.scheme}://{parsed.netloc}/"
-    except Exception:
-        return ""
+def uuid_from_uri(uri: str) -> str | None:
+    matches = UUID_RE.findall(uri)
+    return matches[-1] if matches else None
 
 
-def allowed_uri(uri: str, allow_ns: list[str], extra_hosts: set[str]) -> bool:
-    if any(uri.startswith(ns) for ns in EXPAND_EXCLUDE_NS):
-        return False
-    if any(uri.startswith(ns) for ns in allow_ns):
-        return True
-    h = host_of(uri)
-    return h in extra_hosts
+def besluit_uuid_from_graph(graph: Graph, besluit_uri: str) -> str | None:
+    for value in graph.objects(URIRef(besluit_uri), MU_UUID):
+        if isinstance(value, Literal):
+            return str(value)
+    return None
+
+
+def existing_besluit_uuids(data_dir: Path) -> set[str]:
+    found: set[str] = set()
+    if not data_dir.exists():
+        return found
+    for path in data_dir.glob("*.ttl"):
+        matches = UUID_RE.findall(path.stem)
+        if matches:
+            found.add(matches[-1].lower())
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -159,44 +166,68 @@ def allowed_uri(uri: str, allow_ns: list[str], extra_hosts: set[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 class SparqlClient:
-    def __init__(self, endpoint: str, timeout: int = SPARQL_TIMEOUT, logger: logging.Logger | None = None):
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: int = SPARQL_TIMEOUT,
+        logger: logging.Logger | None = None,
+        delay: float = 0.0,
+    ):
         self.endpoint = endpoint
         self.timeout = timeout
         self.log = logger or logging.getLogger("sparql")
+        self.delay = delay
+        self._last_call_end: float | None = None
+
+    def _wait_for_slot(self) -> None:
+        if self.delay <= 0 or self._last_call_end is None:
+            return
+        wait = self.delay - (time.monotonic() - self._last_call_end)
+        if wait > 0:
+            self.log.debug("waiting %.2fs before the next call to %s", wait, self.endpoint)
+            time.sleep(wait)
+
+    def _mark_call_end(self) -> None:
+        self._last_call_end = time.monotonic()
 
     def _request(self, query: str, accept: str):
+        self._wait_for_slot()
+        self.log.info("SPARQL query on %s:\n%s", self.endpoint, query)
         # POST the query in the body to avoid URL-length limits (HTTP 414/431).
         data = urllib.parse.urlencode({"query": query}).encode("utf-8")
         last_err = None
-        for attempt in range(1, HTTP_RETRIES + 1):
-            try:
-                req = urllib.request.Request(
-                    self.endpoint,
-                    data=data,
-                    headers={
-                        "Accept": accept,
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": "lpdc-fetch-besluiten/0.1",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    return resp.read()
-            except urllib.error.HTTPError as e:
-                last_err = e
-                body = ""
+        try:
+            for attempt in range(1, HTTP_RETRIES + 1):
                 try:
-                    body = e.read().decode("utf-8", "replace")[:300]
-                except Exception:
-                    pass
-                self.log.warning("HTTP %s on %s (attempt %d/%d): %s", e.code, self.endpoint, attempt, HTTP_RETRIES, body)
-                if e.code in (400,):
-                    break  # query error, no point retrying
-            except (urllib.error.URLError, TimeoutError) as e:
-                last_err = e
-                self.log.warning("Network error on %s (attempt %d/%d): %s", self.endpoint, attempt, HTTP_RETRIES, e)
-            time.sleep(RETRY_BACKOFF * attempt)
-        raise RuntimeError(f"SPARQL request failed for {self.endpoint}: {last_err}")
+                    req = urllib.request.Request(
+                        self.endpoint,
+                        data=data,
+                        headers={
+                            "Accept": accept,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": "lpdc-fetch-besluiten/0.1",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                        return resp.read()
+                except urllib.error.HTTPError as e:
+                    last_err = e
+                    body = ""
+                    try:
+                        body = e.read().decode("utf-8", "replace")[:300]
+                    except Exception:
+                        pass
+                    self.log.warning("HTTP %s on %s (attempt %d/%d): %s", e.code, self.endpoint, attempt, HTTP_RETRIES, body)
+                    if e.code in (400,):
+                        break  # query error, no point retrying
+                except (urllib.error.URLError, TimeoutError) as e:
+                    last_err = e
+                    self.log.warning("Network error on %s (attempt %d/%d): %s", self.endpoint, attempt, HTTP_RETRIES, e)
+                time.sleep(RETRY_BACKOFF * attempt)
+            raise RuntimeError(f"SPARQL request failed for {self.endpoint}: {last_err}")
+        finally:
+            self._mark_call_end()
 
     def select(self, query: str) -> list[dict]:
         raw = self._request(query, "application/sparql-results+json")
@@ -216,6 +247,7 @@ class SparqlClient:
         """Fast liveness check: a trivial SELECT, one attempt, short timeout."""
         q = "SELECT * WHERE { ?s ?p ?o } LIMIT 1"
         params = urllib.parse.urlencode({"query": q}).encode("utf-8")
+        self._wait_for_slot()
         try:
             req = urllib.request.Request(
                 self.endpoint,
@@ -233,6 +265,8 @@ class SparqlClient:
         except Exception as e:
             self.log.info("ping failed for %s: %s", self.endpoint, e)
             return False
+        finally:
+            self._mark_call_end()
 
 
 def values_block(uris: Iterable[str]) -> str:
@@ -243,70 +277,32 @@ def values_block(uris: Iterable[str]) -> str:
 # Discovery: which endpoints have data for a bestuur, and which besluiten
 # ---------------------------------------------------------------------------
 
-DISCOVER_BY_ORGANS_QUERY = """
+DISCOVERY_PREFIXES = """
 PREFIX besluit: <http://data.vlaanderen.be/ns/besluit#>
-PREFIX mandaat: <http://data.vlaanderen.be/ns/mandaat#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX dct: <http://purl.org/dc/terms/>
-PREFIX eli: <http://data.europa.eu/eli/ontology#>
-SELECT DISTINCT ?besluit WHERE {
-  VALUES ?bo { {organs} }
+PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
+"""
+
+DISCOVERY_QUERY = """
+SELECT DISTINCT ?besluit ?uuid WHERE {
+  VALUES ?boInTijd { {organs} }
   ?besluit a besluit:Besluit .
-  {
-    ?besluit eli:passed_by ?bo .
-  }
-  UNION
-  {
-    ?boInTijd mandaat:isTijdspecialisatieVan ?bo .
-    ?besluit eli:passed_by ?boInTijd .
-  }
-  UNION
-  {
-    ?lr eli:passed_by ?bo .
-    ?besluit eli:realizes ?lr .
-  }
-  UNION
-  {
-    ?boInTijd mandaat:isTijdspecialisatieVan ?bo .
-    ?lr eli:passed_by ?boInTijd .
-    ?besluit eli:realizes ?lr .
-  }
-  UNION
-  {
-    ?zitting besluit:isGehoudenDoor ?bo .
-    ?zitting besluit:behandelt ?agendapunt .
-    ?behandeling dct:subject ?agendapunt .
-    ?besluit prov:wasGeneratedBy ?behandeling .
-  }
-  UNION
-  {
-    ?boInTijd mandaat:isTijdspecialisatieVan ?bo .
-    ?zitting besluit:isGehoudenDoor ?boInTijd .
-    ?zitting besluit:behandelt ?agendapunt .
-    ?behandeling dct:subject ?agendapunt .
-    ?besluit prov:wasGeneratedBy ?behandeling .
-  }
-  UNION
-  {
-    ?besluit prov:wasGeneratedBy ?behandeling .
-    ?behandeling prov:wasAssociatedWith ?bo .
-  }
+  ?zitting besluit:isGehoudenDoor ?boInTijd .
+  ?zitting besluit:behandelt ?agendapunt .
+  ?behandeling dct:subject ?agendapunt .
+  ?besluit prov:wasGeneratedBy ?behandeling .
+  OPTIONAL { ?besluit mu:uuid ?uuid }
 }
 """
 
-ORGS_BY_BESTUUR_QUERY = """
+ORGANS_IN_TIJD_BY_BESTUUR_QUERY = """
 PREFIX besluit: <http://data.vlaanderen.be/ns/besluit#>
-SELECT DISTINCT ?bo WHERE { ?bo besluit:bestuurt <{bestuur}> }
-"""
-
-ORGS_BY_LABEL_QUERY = """
-PREFIX besluit: <http://data.vlaanderen.be/ns/besluit#>
-PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-SELECT DISTINCT ?bo WHERE {
-  ?bo a besluit:Bestuursorgaan ;
-      skos:prefLabel ?label .
-  FILTER(LANG(?label) = "" || LANG(?label) = "nl")
-  FILTER(CONTAINS(LCASE(STR(?label)), LCASE("{name}")))
+PREFIX mandaat: <http://data.vlaanderen.be/ns/mandaat#>
+SELECT DISTINCT ?boInTijd WHERE {
+  ?boInTijd a besluit:Bestuursorgaan ;
+            mandaat:isTijdspecialisatieVan ?bo .
+  ?bo besluit:bestuurt <{bestuur}> .
 }
 """
 
@@ -326,13 +322,13 @@ SELECT ?label ?lang WHERE {
 @dataclass
 class EndpointHit:
     endpoint: str
-    besluiten: list[str]
+    besluiten: dict[str, str | None]
 
 
 def connect_endpoints(endpoints: list[str], logger: logging.Logger) -> dict[str, SparqlClient]:
     clients: dict[str, SparqlClient] = {}
     for ep in endpoints:
-        client = SparqlClient(ep, logger=logger)
+        client = SparqlClient(ep, logger=logger, delay=HARVESTER_DELAY)
         if not client.ping():
             logger.info("endpoint %s not reachable, skipping", ep)
             continue
@@ -340,37 +336,35 @@ def connect_endpoints(endpoints: list[str], logger: logging.Logger) -> dict[str,
     return clients
 
 
-def discover_besluiten_by_organs(client: SparqlClient, organs: list[str]) -> list[str]:
+def discover_besluiten_by_organs(client: SparqlClient, organs: list[str]) -> dict[str, str | None]:
     if not organs:
-        return []
-    q = DISCOVER_BY_ORGANS_QUERY.replace("{organs}", values_block(organs))
+        return {}
+    found: dict[str, str | None] = {}
+    template = DISCOVERY_PREFIXES + DISCOVERY_QUERY
+    for organ in organs:
+        q = template.replace("{organs}", f"<{organ}>")
+        client.log.debug("discover on %s for organ %s", client.endpoint, organ)
+        try:
+            rows = client.select(q)
+        except RuntimeError as e:
+            client.log.info("discover failed on %s for %s: %s", client.endpoint, organ, e)
+            continue
+        for row in rows:
+            uri = row.get("besluit")
+            if uri:
+                found.setdefault(uri, row.get("uuid"))
+    return found
+
+
+def organs_in_tijd_for_bestuur(client: SparqlClient, bestuur_uri: str) -> list[str]:
     try:
-        rows = client.select(q)
+        rows = client.select(
+            ORGANS_IN_TIJD_BY_BESTUUR_QUERY.replace("{bestuur}", bestuur_uri)
+        )
     except RuntimeError as e:
-        client.log.info("discover (by organs) failed on %s: %s", client.endpoint, e)
+        client.log.info("organs_in_tijd_for_bestuur failed on %s: %s", client.endpoint, e)
         return []
-    return [r["besluit"] for r in rows if r.get("besluit")]
-
-
-def organs_for_bestuur(client: SparqlClient, bestuur_uri: str) -> list[str]:
-    try:
-        rows = client.select(ORGS_BY_BESTUUR_QUERY.replace("{bestuur}", bestuur_uri))
-    except RuntimeError as e:
-        client.log.info("organs_for_bestuur failed on %s: %s", client.endpoint, e)
-        return []
-    return [r["bo"] for r in rows if r.get("bo")]
-
-
-def organs_by_label(client: SparqlClient, name: str) -> list[str]:
-    # Escape quotes in the name; this is interpolated into a string literal.
-    safe = name.replace('"', "")
-    q = ORGS_BY_LABEL_QUERY.replace("{name}", safe)
-    try:
-        rows = client.select(q)
-    except RuntimeError as e:
-        client.log.info("organs_by_label failed on %s: %s", client.endpoint, e)
-        return []
-    return [r["bo"] for r in rows if r.get("bo")]
+    return [r["boInTijd"] for r in rows if r.get("boInTijd")]
 
 
 def uuid_for_bestuur(client: SparqlClient, bestuur_uri: str) -> str | None:
@@ -445,49 +439,46 @@ def find_bestuur_label(
     return None
 
 
-def collect_base_organs(
-    clients: dict[str, SparqlClient], bestuur_uri: str, name: str, logger: logging.Logger
+def collect_organs_in_tijd(
+    registry: SparqlClient,
+    bestuur_uri: str,
+    logger: logging.Logger,
 ) -> list[str]:
-    """Collect the base bestuursorganen for a bestuur from every endpoint.
-
-    The `bestuurt` link lives on the registry, while the zitting and the
-    bestuursorgaan in tijd live on the harvesters. So we gather the base organs
-    from all endpoints, then use them everywhere.
-    """
-    organs: set[str] = set()
-    for ep, client in clients.items():
-        found = organs_for_bestuur(client, bestuur_uri)
-        logger.info("endpoint %s knows %d bestuursorgaan(en) for %s", ep, len(found), bestuur_uri)
-        organs.update(found)
-    if not organs and name:
-        for ep, client in clients.items():
-            found = organs_by_label(client, name)
-            if found:
-                logger.info("label fallback found %d orgaan(en) for %s on %s", len(found), name, ep)
-                organs.update(found)
-    return sorted(organs)
+    """Collect the bestuursorganen in tijd of a bestuur from the registry."""
+    organs_in_tijd = organs_in_tijd_for_bestuur(registry, bestuur_uri)
+    logger.info(
+        "registry %s knows %d bestuursorgaan(en) in tijd for %s",
+        registry.endpoint, len(organs_in_tijd), bestuur_uri,
+    )
+    return sorted(organs_in_tijd)
 
 
 def probe_endpoints(
-    clients: dict[str, SparqlClient], bestuur_uri: str, name: str, logger: logging.Logger
-) -> list[EndpointHit]:
-    organs = collect_base_organs(clients, bestuur_uri, name, logger)
-    label = name or bestuur_uri
-    if not organs:
-        logger.warning("no bestuursorgaan found for %s on any endpoint", label)
-        return []
-    logger.info("using %d base bestuursorgaan(en) for %s", len(organs), label)
-    hits: list[EndpointHit] = []
+    clients: dict[str, SparqlClient],
+    organs_in_tijd: list[str],
+    bestuur_uri: str,
+    logger: logging.Logger,
+) -> EndpointHit | None:
+    if not organs_in_tijd:
+        logger.warning("no bestuursorgaan in tijd found for %s on the registry", bestuur_uri)
+        return None
+    logger.info(
+        "processing %d bestuursorgaan(en) in tijd one by one for %s",
+        len(organs_in_tijd), bestuur_uri,
+    )
     for ep, client in clients.items():
-        besluiten = discover_besluiten_by_organs(client, organs)
+        besluiten = discover_besluiten_by_organs(client, organs_in_tijd)
         logger.info("endpoint %s returned %d besluiten for %s", ep, len(besluiten), bestuur_uri)
         if besluiten:
-            hits.append(EndpointHit(endpoint=ep, besluiten=besluiten))
-    return hits
+            logger.info(
+                "using %s for %s; ignoring the other harvesters", ep, bestuur_uri
+            )
+            return EndpointHit(endpoint=ep, besluiten=besluiten)
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Per-besluit subgraph fetch (walk the SHACL path, liberal)
+# Per-besluit fetch (fixed path)
 # ---------------------------------------------------------------------------
 
 def binding_to_node(term: dict):
@@ -535,7 +526,7 @@ def describe_subjects(
 ) -> Graph:
     """All triples whose subject is one of `uris`, minus the blacklisted predicates."""
     out = Graph()
-    exclude = " ".join(f"<{p}>" for p in sorted(blacklist or ()))
+    exclude = ", ".join(f"<{p}>" for p in sorted(blacklist or ()))
     filter_clause = f" FILTER(?p NOT IN ({exclude}))" if exclude else ""
     for i in range(0, len(uris), batch):
         chunk = uris[i : i + batch]
@@ -547,87 +538,88 @@ def describe_subjects(
     return out
 
 
-def inverse_links(
+def forward_targets(graph: Graph, nodes: set[str], predicate: str) -> set[str]:
+    """Objects of `predicate` on `nodes`, taken from the graph already fetched."""
+    pred = URIRef(predicate)
+    targets: set[str] = set()
+    for node in nodes:
+        for obj in graph.objects(URIRef(node), pred):
+            if isinstance(obj, URIRef):
+                targets.add(str(obj))
+    return targets
+
+
+def inverse_targets(
     clients: list[SparqlClient],
-    uris: list[str],
-    blacklist: set[str] | None = None,
+    nodes: set[str],
+    predicate: str,
     batch: int = 40,
-) -> Graph:
-    """Triples where one of `uris` is the object, for INVERSE_PREDICATES only."""
-    out = Graph()
-    predicates = [p for p in INVERSE_PREDICATES if p not in (blacklist or set())]
-    if not predicates:
-        return out
-    preds = " ".join(f"<{p}>" for p in predicates)
-    for i in range(0, len(uris), batch):
-        chunk = uris[i : i + batch]
+) -> set[str]:
+    """Subjects that point at one of `nodes` with `predicate`."""
+    targets: set[str] = set()
+    ordered = sorted(nodes)
+    for i in range(0, len(ordered), batch):
+        chunk = ordered[i : i + batch]
         q = (
-            "SELECT ?s ?p ?o WHERE { "
-            "VALUES ?p { " + preds + " } "
-            "VALUES ?o { " + values_block(chunk) + " } "
-            "?s ?p ?o }"
+            "SELECT ?s WHERE { VALUES ?o { " + values_block(chunk) + " } "
+            f"?s <{predicate}> ?o }}"
         )
-        out += select_triples(clients, q)
-    return out
+        for client in clients:
+            try:
+                rows = client.select(q)
+            except RuntimeError as e:
+                client.log.warning("query failed on %s: %s", client.endpoint, e)
+                continue
+            for row in rows:
+                if row.get("s"):
+                    targets.add(row["s"])
+    return targets
 
 
-def fetch_subgraph(
+def fetch_path(
     clients: list[SparqlClient],
     besluit: str,
-    max_depth: int,
-    allow_ns: list[str],
     triple_cap: int,
     blacklist: set[str],
     logger: logging.Logger,
 ) -> Graph:
-    """Walk outward from the besluit up to `max_depth` hops, keeping all triples
-    of the resources along the way. Queries go to every client and the results
-    are merged, so links that live on different endpoints (for example
-    `bestuurt` on the registry and the zitting on a harvester) end up in the
-    same migration."""
+    """Collect the resources on the fixed besluit path and all their triples.
+
+    `clients` are the harvesters. Only the besluit, behandeling, artikel,
+    agendapunt and zitting are described. Links to other resources stay in the
+    graph as references but those resources are not fetched.
+    """
     g = Graph()
-    extra_hosts = {host_of(besluit)}
-    seeds: set[str] = {besluit}
-    visited: set[str] = set()
+    role_nodes: dict[str, set[str]] = {role: set() for role in PATH_ROLES}
+    role_nodes["besluit"].add(besluit)
+    described: set[str] = set()
 
-    for depth in range(max_depth + 1):
-        new = [u for u in seeds if u not in visited]
-        if not new:
-            break
+    for role in PATH_ROLES:
+        nodes = role_nodes[role]
+        if not nodes:
+            continue
 
-        forward = describe_subjects(clients, new, blacklist)
-        g += forward
-
-        back = inverse_links(clients, new, blacklist)
-        g += back
+        new = sorted(nodes - described)
+        if new:
+            g += describe_subjects(clients, new, blacklist)
+        described.update(new)
 
         if len(g) > triple_cap:
             logger.warning(
-                "triple cap (%d) reached for %s at depth %d; stopping expansion",
-                triple_cap, besluit, depth,
+                "triple cap (%d) reached for %s at %s; stopping",
+                triple_cap, besluit, role,
             )
             break
 
-        # collect candidate URIs to expand next: objects of forward + subjects of
-        # inverse. Skip objects reached via SKIP_EXPAND_PREDICATES so ordering
-        # links do not pull sibling besluiten into this migration.
-        candidates: set[str] = set()
-        for s, p, o in forward:
-            if isinstance(o, URIRef) and str(p) not in SKIP_EXPAND_PREDICATES:
-                candidates.add(str(o))
-        for s, p, o in back:
-            if isinstance(s, URIRef):
-                candidates.add(str(s))
-            if isinstance(o, URIRef) and str(p) not in SKIP_EXPAND_PREDICATES:
-                candidates.add(str(o))
-
-        candidates = {
-            u for u in candidates
-            if allowed_uri(u, allow_ns, extra_hosts) and u not in visited
-        }
-
-        visited.update(new)
-        seeds = candidates
+        for step in PATH_STEPS:
+            if step.source != role or step.predicate in blacklist:
+                continue
+            if step.inverse:
+                targets = inverse_targets(clients, nodes, step.predicate)
+            else:
+                targets = forward_targets(g, nodes, step.predicate)
+            if targets:
+                role_nodes[step.target].update(targets)
 
     return g
 
@@ -730,6 +722,7 @@ class RunReport:
     endpoints_with_besluiten: list[str] = field(default_factory=list)
     besluit_count: int = 0
     written: int = 0
+    skipped: int = 0
 
 
 def default_config_path() -> Path:
@@ -817,16 +810,14 @@ def setup_logging(verbose: bool, log_file: Path | None) -> logging.Logger:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Fetch besluiten per bestuur as mu migrations (graph+ttl+svg).")
     p.add_argument("--config", default=str(default_config_path()), help="JSON config file (default: config.json next to this script).")
-    p.add_argument("--out", default="./out", help="Output root (default ./out). Data lands in <out>/data/<slug>/.")
+    p.add_argument("--out", default="./out", help="Output root (default ./out). Data lands flat in <out>/data/.")
     p.add_argument("--endpoints", help="Comma-separated SPARQL endpoints. Overrides the config file.")
     p.add_argument("--besluit-list-file", help="JSON mapping bestuur URI or prefLabel slug -> [besluit URIs] to skip discovery.")
     p.add_argument("--limit", type=int, default=0, help="Cap besluiten per bestuur (0 = no cap).")
-    p.add_argument("--max-depth", type=int, default=3, help="Expansion hops from each besluit (default 3, reaches the zitting).")
-    p.add_argument("--triple-cap", type=int, default=200000, help="Stop expanding a besluit subgraph past this many triples.")
+    p.add_argument("--triple-cap", type=int, default=200000, help="Stop fetching a besluit past this many triples.")
     p.add_argument("--dry-run", action="store_true", help="Only discover and list besluiten; write no ttl/svg.")
     p.add_argument("--no-svg", action="store_true", help="Skip the SVG drawing.")
     p.add_argument("--ttl2svg", help="Path to a ttl2svg clone or visualize_ttl.py. Default: vendor dir, then a local clone, then the cache.")
-    p.add_argument("--allow-ns", help="Comma-separated extra namespace prefixes to expand.")
     p.add_argument("--only", help="Comma-separated bestuur URIs to process (exact match).")
     p.add_argument("--sparql-timeout", type=int, default=SPARQL_TIMEOUT, help="Per-request timeout in seconds.")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
@@ -838,6 +829,8 @@ def main(argv: list[str] | None = None) -> int:
     logger = setup_logging(args.verbose, log_file)
 
     logger.info("SHACL reference: %s", SHACL_URL)
+    logger.info("Path: zitting -> agendapunt <- behandeling <-> besluit -> artikel")
+    logger.info("Organen in tijd come from the registry for discovery only")
     registry = config["registry"]
     endpoints = [e.strip() for e in args.endpoints.split(",") if e.strip()] if args.endpoints else config["endpoints"]
     besturen = config["besturen"]
@@ -845,9 +838,6 @@ def main(argv: list[str] | None = None) -> int:
     blacklist_entries = config["predicate_blacklist"]
     blacklist = {entry["predicate"] for entry in blacklist_entries}
     besluit_list_override = load_besluit_list(args.besluit_list_file) if args.besluit_list_file else {}
-    allow_ns = list(DEFAULT_ALLOW_NS)
-    if args.allow_ns:
-        allow_ns += [n.strip() for n in args.allow_ns.split(",") if n.strip()]
 
     only = {s.strip() for s in args.only.split(",")} if args.only else None
 
@@ -860,7 +850,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("  %s: %s", entry["predicate"], entry["comment"])
         else:
             logger.info("  %s", entry["predicate"])
-    logger.info("dry_run=%s limit=%s max_depth=%s no_svg=%s", args.dry_run, args.limit, args.max_depth, args.no_svg)
+    logger.info("dry_run=%s limit=%s no_svg=%s", args.dry_run, args.limit, args.no_svg)
 
     registry_client = SparqlClient(registry, logger=logger)
     if not registry_client.ping():
@@ -870,11 +860,13 @@ def main(argv: list[str] | None = None) -> int:
     if not harvester_clients:
         logger.error("no reachable harvester endpoint")
         return 1
-    clients = {registry: registry_client}
-    clients.update(harvester_clients)
-    logger.info("live endpoints: %s", list(clients.keys()))
+    clients = dict(harvester_clients)
+    logger.info("live harvesters: %s", list(clients.keys()))
 
     reports: list[RunReport] = []
+    data_dir = out_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    existing_uuids = existing_besluit_uuids(data_dir)
 
     for bestuur_uri, name in besturen:
         if only and bestuur_uri not in only:
@@ -895,30 +887,34 @@ def main(argv: list[str] | None = None) -> int:
         report = RunReport(bestuur=pref_label, slug=slug, uuid=uuid, uri=bestuur_uri)
         logger.info("mu:uuid: %s, label: %s", uuid, pref_label)
 
+        organs_in_tijd = collect_organs_in_tijd(
+            registry_client, bestuur_uri, logger
+        )
+
         override = besluit_list_override.get(bestuur_uri) or besluit_list_override.get(slug)
+        fetch_clients = list(clients.values())
         if override is not None:
-            besluit_to_endpoints = {b: "manual" for b in override}
+            besluit_to_endpoints = {b: ("manual", None) for b in override}
             logger.info("using manual besluit list for %s (%d besluiten)", report.bestuur, len(override))
         else:
-            hits = probe_endpoints(clients, bestuur_uri, pref_label, logger)
-            if not hits:
+            hit = probe_endpoints(clients, organs_in_tijd, bestuur_uri, logger)
+            if hit is None:
                 logger.warning("No besluiten found for %s on any endpoint.", report.bestuur)
                 reports.append(report)
                 continue
-            besluit_to_endpoints = {}
-            for hit in hits:
-                report.endpoints_with_besluiten.append(hit.endpoint)
-                for b in hit.besluiten:
-                    besluit_to_endpoints.setdefault(b, hit.endpoint)
+            report.endpoints_with_besluiten.append(hit.endpoint)
+            fetch_clients = [clients[hit.endpoint]]
+            besluit_to_endpoints = {
+                b: (hit.endpoint, besluit_uuid)
+                for b, besluit_uuid in hit.besluiten.items()
+            }
 
         besluiten = list(besluit_to_endpoints.keys())
         report.besluit_count = len(besluiten)
         logger.info("total unique besluiten for %s: %d", report.bestuur, len(besluiten))
 
         # write a global index (also in dry-run)
-        data_dir = out_root / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        index_path = data_dir / f"{slug}__besluiten-index.json"
+        index_path = data_dir / f"{slug}-besluiten-index.json"
         index_payload = {
             "bestuur": report.bestuur,
             "bestuur_uuid": uuid,
@@ -927,7 +923,12 @@ def main(argv: list[str] | None = None) -> int:
             "endpoints": report.endpoints_with_besluiten,
             "besluit_count": len(besluiten),
             "besluiten": [
-                {"besluit": b, "endpoint": besluit_to_endpoints[b]} for b in besluiten
+                {
+                    "besluit": b,
+                    "endpoint": besluit_to_endpoints[b][0],
+                    "uuid": besluit_to_endpoints[b][1] or uuid_from_uri(b),
+                }
+                for b in besluiten
             ],
         }
         index_path.write_text(json.dumps(index_payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -943,25 +944,44 @@ def main(argv: list[str] | None = None) -> int:
 
         chosen = besluiten[: args.limit] if args.limit else besluiten
         ts = now_ts()
-        live_clients = list(clients.values())
         for i, besluit in enumerate(chosen, 1):
+            besluit_uuid = besluit_to_endpoints[besluit][1]
+            candidates = {
+                value.lower()
+                for value in (besluit_uuid, uuid_from_uri(besluit))
+                if value
+            }
+            if candidates & existing_uuids:
+                logger.info("[%d/%d] skip %s, already downloaded", i, len(chosen), besluit)
+                report.skipped += 1
+                continue
             logger.info("[%d/%d] fetching %s", i, len(chosen), besluit)
             try:
-                sub = fetch_subgraph(
-                    live_clients, besluit, args.max_depth, allow_ns,
-                    args.triple_cap, blacklist, logger,
+                sub = fetch_path(
+                    fetch_clients, besluit, args.triple_cap, blacklist, logger,
                 )
             except Exception as e:
-                logger.error("failed to fetch subgraph for %s: %s", besluit, e)
+                logger.error("failed to fetch path for %s: %s", besluit, e)
                 continue
             if len(sub) == 0:
                 logger.error("no triples found for %s on any endpoint", besluit)
                 continue
-            base = f"{slug}__{ts}-{uri_to_safe_name(besluit)}"
+            file_uuid = (
+                besluit_uuid_from_graph(sub, besluit)
+                or besluit_uuid
+                or uuid_from_uri(besluit)
+                or uri_to_safe_name(besluit)
+            )
+            if file_uuid.lower() in existing_uuids:
+                logger.info("[%d/%d] skip %s, already downloaded", i, len(chosen), besluit)
+                report.skipped += 1
+                continue
+            base = f"{ts}-{slug}-{file_uuid}"
             write_migration(
                 data_dir, base, graph_template.format(uuid=uuid), sub,
                 do_svg=not args.no_svg, ttl2svg=args.ttl2svg, logger=logger,
             )
+            existing_uuids.add(file_uuid.lower())
             report.written += 1
 
         reports.append(report)
@@ -970,8 +990,8 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("==== summary ====")
     for r in reports:
         logger.info(
-            "%s: besluiten=%d written=%d endpoints=%s",
-            r.bestuur, r.besluit_count, r.written, r.endpoints_with_besluiten,
+            "%s: besluiten=%d written=%d skipped=%d endpoints=%s",
+            r.bestuur, r.besluit_count, r.written, r.skipped, r.endpoints_with_besluiten,
         )
     summary_path = out_root / "logs" / f"summary-{now_ts()}.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -985,6 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
                     "uuid": r.uuid,
                     "besluit_count": r.besluit_count,
                     "written": r.written,
+                    "skipped": r.skipped,
                     "endpoints": r.endpoints_with_besluiten,
                 }
                 for r in reports
